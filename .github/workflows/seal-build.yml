@@ -1,0 +1,279 @@
+# Authored for the sealed build: upstream builds releases on Concourse
+# (ci/scripts/build-project.sh: ./gradlew build publishAllPublicationsToDeploymentRepository)
+# and ships no GitHub Actions workflow that builds or tests. This replays that
+# command verbatim on JDK 17 and uploads the spring-webflux jar.
+name: Seal Build spring-webflux
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test selector, e.g. ':spring-webflux:test --tests org.springframework.web.reactive.resource.ResourceWebHandlerTests'; empty runs the full upstream build and suite"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test (JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Liberica 17.0.7: Spring's toolchain vendor (BELLSOFT) at the update current
+      # when 6.0.11 was released. Later 17.0.x updates (JDK-8071693 backport) make
+      # java.beans.Introspector report the AgeHolder default age() method, which
+      # breaks FreeMarkerMacroTests age()/testAge() in spring-webflux/spring-webmvc.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: '17.0.7'
+
+      - name: Install Gradle test result reporter
+        shell: bash
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/seal-test-results.gradle <<'EOF'
+          allprojects {
+            // Javadoc is documentation only (not in the jar); build.gradle links
+            // https://javadoc.io/static/io.rsocket/rsocket-core/1.1.1/ whose package-list now 404s.
+            tasks.withType(Javadoc).configureEach { enabled = false }
+            tasks.withType(Test).configureEach { t ->
+              t.outputs.upToDateWhen { false }
+              t.outputs.cacheIf { false }
+              def skippedFile = t.project.file("build/seal-skipped/${t.name}.tsv")
+              t.doFirst {
+                skippedFile.parentFile.mkdirs()
+                skippedFile.text = ''
+              }
+              t.afterTest { desc, result ->
+                if (result.resultType == TestResult.ResultType.SKIPPED) {
+                  skippedFile << "${desc.className}\t${desc.name}\n"
+                }
+                if (result.resultType == TestResult.ResultType.FAILURE) {
+                  println "TEST FAILED: ${desc.className} > ${desc.name}"
+                }
+              }
+              t.afterSuite { desc, result ->
+                if (desc.parent == null) {
+                  println "TEST SUMMARY ${t.path}: tests=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount} result=${result.resultType}"
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p seal-logs
+          repository=$(pwd)/distribution-repository
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --console=plain --no-scan --no-build-cache --stacktrace -PdeploymentRepository=${repository} :spring-webflux:publishAllPublicationsToDeploymentRepository ${{ inputs.test-filter }} 2>&1 | tee seal-logs/gradle.log
+          else
+            ./gradlew -Dorg.gradle.internal.launcher.welcomeMessageEnabled=false --no-daemon --max-workers=4 --console=plain --no-scan --no-build-cache --continue --stacktrace -PdeploymentRepository=${repository} build publishAllPublicationsToDeploymentRepository 2>&1 | tee seal-logs/gradle.log
+          fi
+
+      - name: Report test results and skip reasons
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/skip_reasons.py" <<'EOF'
+          import glob, re
+
+          index = {}
+          for p in glob.glob('**/src/test*/**/*.java', recursive=True) + glob.glob('**/src/test*/**/*.kt', recursive=True):
+              parts = p.split('/src/', 1)[1].split('/', 2)
+              if len(parts) < 3:
+                  continue
+              fqcn = parts[2].rsplit('.', 1)[0].replace('/', '.')
+              index.setdefault(fqcn, p)
+
+          ANN = re.compile(r'@(Disabled\w*|Enabled\w*|Ignore|IfProfileValue)\b(\([^)]*\))?')
+
+          def explain(ann):
+              if ann.startswith('@EnabledForTestGroups'):
+                  return ann + ' -- opt-in test group: only runs when -PtestGroups=<group> is set; upstream CI never sets it'
+              if ann.startswith('@Disabled('):
+                  return ann + ' -- disabled upstream with the given message'
+              if ann == '@Disabled':
+                  return ann + ' -- disabled upstream in source (annotation carries no message)'
+              return ann + ' -- upstream conditional-execution annotation'
+
+          def comments_above(lines, i, n=12):
+              out = []
+              for j in range(max(0, i - n), i):
+                  s = lines[j].strip()
+                  if s.startswith('//') or s.startswith('*') or s.startswith('/*'):
+                      s = s.lstrip('/* ').strip()
+                      if s and not s.startswith('@'):
+                          out.append(s)
+              return ' '.join(out)[:300]
+
+          def class_annotations(lines, simple):
+              for i, l in enumerate(lines):
+                  if re.search(r'\b(class|interface)\s+' + re.escape(simple) + r'\b', l):
+                      found = []
+                      for j in range(i, max(-1, i - 10), -1):
+                          found += [m.group(0) for m in ANN.finditer(lines[j])]
+                          if j < i and (lines[j].strip().endswith('}') or lines[j].strip().endswith(';')):
+                              break
+                      return found, comments_above(lines, i)
+              return [], ''
+
+          def assumptions(lines, i):
+              # assume*() calls in the method body (JUnit assumption-based skips)
+              out = []
+              j = i
+              end = min(len(lines), i + 40)
+              while j < end:
+                  l = lines[j]
+                  if j > i and (l.startswith('\t}') and not l.startswith('\t\t')):
+                      break
+                  if re.search(r'\bassume\w*\s*\(', l):
+                      stmt = l.strip()
+                      k = j
+                      while not stmt.rstrip().endswith(';') and k + 1 < end:
+                          k += 1
+                          stmt += ' ' + lines[k].strip()
+                      out.append(stmt)
+                      j = k
+                  j += 1
+              return out
+
+          def read(path):
+              return open(path, encoding='utf-8').read().split('\n')
+
+          def resolve_class(simple, pkg):
+              simple = simple.split('.')[-1]
+              if pkg + '.' + simple in index:
+                  return pkg + '.' + simple
+              for k in index:
+                  if k.endswith('.' + simple):
+                      return k
+              return None
+
+          def chain(fqcn):
+              # the test class followed by its superclasses that live in test sources
+              out = []
+              seen = set()
+              cur = fqcn
+              while cur and cur in index and cur not in seen:
+                  seen.add(cur)
+                  path = index[cur]
+                  out.append((cur, path))
+                  lines = read(path)
+                  simple = cur.split('.')[-1]
+                  pkg = cur.rsplit('.', 1)[0]
+                  nxt = None
+                  for i, l in enumerate(lines):
+                      if re.search(r'\bclass\s+' + re.escape(simple) + r'\b', l):
+                          decl = ' '.join(lines[i:i + 3])
+                          m = re.search(r'\bclass\s+' + re.escape(simple) + r'\b[^{]*?\bextends\s+([\w.]+)', decl)
+                          if m:
+                              nxt = resolve_class(m.group(1), pkg)
+                          break
+                  cur = nxt
+              return out
+
+          def method_reason(path, lines, method):
+              for i, l in enumerate(lines):
+                  if re.search(r'(void|fun)\s+`?' + re.escape(method) + r'`?\s*\(', l):
+                      anns = []
+                      for j in range(i, max(-1, i - 8), -1):
+                          anns += [m.group(0) for m in ANN.finditer(lines[j])]
+                      if anns:
+                          return '; '.join(explain(a) for a in anns) + ' [method level, ' + path + ':' + str(i + 1) + ']'
+                      asm = assumptions(lines, i)
+                      if asm:
+                          return 'JUnit assumption not met in this environment: ' + ' | '.join(asm)[:400] + ' [' + path + ':' + str(i + 1) + ']'
+                      return None
+              return None
+
+          def setup_assumption(path, lines):
+              # assume*() inside a class-level @BeforeAll / @BeforeClass method skips every test in the class
+              for i, l in enumerate(lines):
+                  if re.search(r'@(BeforeAll|BeforeClass)\b', l):
+                      for k in range(i, min(len(lines), i + 4)):
+                          if re.search(r'\bvoid\s+\w+\s*\(', lines[k]):
+                              asm = assumptions(lines, k)
+                              if asm:
+                                  return 'class-level assumption in @BeforeAll/@BeforeClass not met in this environment: ' + ' | '.join(asm)[:400] + ' [' + path + ':' + str(k + 1) + ']'
+                              break
+              return None
+
+          total = unresolved = 0
+          for tsv in sorted(glob.glob('**/build/seal-skipped/*.tsv', recursive=True)):
+              for row in open(tsv):
+                  row = row.rstrip('\n')
+                  if not row:
+                      continue
+                  total += 1
+                  cls, name = row.split('\t', 1)
+                  target = cls if cls.split('$')[0] in index else name
+                  outer = target.split('$')[0]
+                  reason = None
+                  method = re.sub(r'\(.*', '', name)
+                  method = re.sub(r'\s*\[.*', '', method)
+                  hierarchy = chain(outer)
+                  if target == cls:
+                      for fq, path in hierarchy:
+                          reason = method_reason(path, read(path), method)
+                          if reason:
+                              if fq != outer:
+                                  reason += ' (inherited from ' + fq + ')'
+                              break
+                  if reason is None:
+                      for fq, path in hierarchy:
+                          reason = setup_assumption(path, read(path))
+                          if reason:
+                              break
+                  if reason is None:
+                      for fq, path in hierarchy:
+                          lines = read(path)
+                          names = [fq.split('.')[-1]]
+                          if fq == outer:
+                              names = list(reversed(target.split('$')[1:])) + names
+                          for simple in names:
+                              anns, why = class_annotations(lines, simple.split('.')[-1])
+                              if anns:
+                                  reason = '; '.join(explain(a) for a in anns) + ' [class level on ' + simple + ', ' + path + ']'
+                                  if fq != outer:
+                                      reason += ' (inherited from ' + fq + ')'
+                                  if why:
+                                      reason += ' -- source comment: ' + why
+                                  break
+                          if reason:
+                              break
+                  if reason is None:
+                      unresolved += 1
+                      reason = 'no skip annotation or assumption found in source'
+                  print('SKIPPED TEST: %s > %s -- reason: %s' % (cls, name, reason))
+          print('SKIP REPORT: %d skipped tests listed, %d without a source annotation or assumption' % (total, unresolved))
+          EOF
+          python3 "$RUNNER_TEMP/skip_reasons.py"
+          echo "---- Gradle test summaries ----"
+          if grep -qE "TEST SUMMARY|TEST FAILED" seal-logs/gradle.log; then grep -E "TEST SUMMARY|TEST FAILED" seal-logs/gradle.log; fi
+          python3 - <<'EOF'
+          import re
+          t = p = f = s = 0
+          for line in open('seal-logs/gradle.log', encoding='utf-8', errors='replace'):
+              m = re.search(r'TEST SUMMARY \S+: tests=(\d+) passed=(\d+) failed=(\d+) skipped=(\d+)', line)
+              if m:
+                  t += int(m.group(1)); p += int(m.group(2)); f += int(m.group(3)); s += int(m.group(4))
+          print('TEST RESULTS (all modules): tests=%d passed=%d failed=%d skipped=%d' % (t, p, f, s))
+          EOF
+
+      - name: Upload spring-webflux jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-webflux-jar
+          path: distribution-repository/org/springframework/spring-webflux/6.0.11/spring-webflux-6.0.11.jar
+          if-no-files-found: error
