@@ -51,6 +51,7 @@ import org.springframework.util.Assert;
 import org.springframework.util.FileCopyUtils;
 import org.springframework.util.ObjectUtils;
 import org.springframework.util.StringUtils;
+import org.springframework.web.servlet.resource.ResourceHandlerUtils;
 import org.springframework.web.servlet.support.RequestContextUtils;
 import org.springframework.web.servlet.view.AbstractUrlBasedView;
 
@@ -199,14 +200,13 @@ public class ScriptTemplateView extends AbstractUrlBasedView {
 	 */
 	public void setResourceLoaderPath(String resourceLoaderPath) {
 		String[] paths = StringUtils.commaDelimitedListToStringArray(resourceLoaderPath);
-		this.resourceLoaderPaths = new String[paths.length + 1];
-		this.resourceLoaderPaths[0] = "";
+		this.resourceLoaderPaths = new String[paths.length];
 		for (int i = 0; i < paths.length; i++) {
 			String path = paths[i];
 			if (!path.endsWith("/") && !path.endsWith(":")) {
 				path = path + "/";
 			}
-			this.resourceLoaderPaths[i + 1] = path;
+			this.resourceLoaderPaths[i] = path;
 		}
 	}
 
@@ -336,7 +336,7 @@ public class ScriptTemplateView extends AbstractUrlBasedView {
 	protected void loadScripts(ScriptEngine engine) {
 		if (!ObjectUtils.isEmpty(this.scripts)) {
 			for (String script : this.scripts) {
-				Resource resource = getResource(script);
+				Resource resource = getScriptResource(script);
 				if (resource == null) {
 					throw new IllegalStateException("Script resource [" + script + "] not found");
 				}
@@ -352,9 +352,53 @@ public class ScriptTemplateView extends AbstractUrlBasedView {
 
 	@Nullable
 	protected Resource getResource(String location) {
+		String normalizedLocation = ResourceHandlerUtils.normalizeInputPath(location);
+		if (this.resourceLoaderPaths != null && !ResourceHandlerUtils.shouldIgnoreInputPath(normalizedLocation)) {
+			ApplicationContext context = obtainApplicationContext();
+			for (String path : this.resourceLoaderPaths) {
+				Resource resource = context.getResource(path + normalizedLocation);
+				try {
+					if (resource.exists() && ResourceHandlerUtils.isResourceUnderLocation(context.getResource(path), resource)) {
+						return resource;
+					}
+				}
+				catch (IOException ex) {
+					if (logger.isDebugEnabled()) {
+						String error = "Skip location [" + normalizedLocation + "] due to error";
+						if (logger.isTraceEnabled()) {
+							logger.trace(error, ex);
+						}
+						else {
+							logger.debug(error + ": " + ex.getMessage());
+						}
+					}
+				}
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Resolve a script configured through
+	 * {@link ScriptTemplateConfigurer#setScripts(String...)}.
+	 * <p>Script locations come from application configuration rather than from
+	 * the request, so they are resolved the way {@link #getResource(String)}
+	 * resolved every location before the template path hardening: against the
+	 * {@code ApplicationContext} directly, then under each configured resource
+	 * loader path. Documented locations such as
+	 * {@code "/META-INF/resources/webjars/library/version/library.js"} keep
+	 * working, while request-derived template locations stay hardened.
+	 */
+	@Nullable
+	protected Resource getScriptResource(String location) {
+		ApplicationContext context = obtainApplicationContext();
+		Resource resource = context.getResource(location);
+		if (resource.exists()) {
+			return resource;
+		}
 		if (this.resourceLoaderPaths != null) {
 			for (String path : this.resourceLoaderPaths) {
-				Resource resource = obtainApplicationContext().getResource(path + location);
+				resource = context.getResource(path + location);
 				if (resource.exists()) {
 					return resource;
 				}
